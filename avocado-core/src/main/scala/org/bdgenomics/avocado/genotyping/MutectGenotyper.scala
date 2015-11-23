@@ -161,9 +161,9 @@ class MutectGenotyper(normalId: String,
 
     // get all possible alleles for this mutation call
     val alleles: Set[String] = if (experimentalMutectIndelDetector)
-      Set(alleleObservation.map(_.allele).toSeq: _*)
+      alleleObservation.map(_.allele).toSet
     else
-      Set(alleleObservation.map(_.allele).toSeq: _*).filter(_.length == 1) // only accept length 1 alleles
+      alleleObservation.map(_.allele).toSet.filter(_.length == 1)
     val pointMutation: Boolean = ref.size == 1 && alleles.exists(_.length == 1)
 
     if (experimentalMutectIndelDetector || pointMutation) {
@@ -181,9 +181,9 @@ class MutectGenotyper(normalId: String,
       })
 
       val rankedAlts: Seq[(Double, String)] =
-        (alleles - ref).map { alt =>
+        (alleles - ref).toSeq.map { alt =>
           (model.logOdds(ref, alt, alleleObservation, f), alt)
-        }.toSeq.sorted.reverse
+        }.sorted.reverse
 
       val passingOddsAlts = rankedAlts.filter(oa => oa._1 >= threshold)
 
@@ -207,25 +207,27 @@ class MutectGenotyper(normalId: String,
           t.value.contains(ReferencePosition(region.referenceName, region.start))
         })
 
-        val passSomatic: Boolean = (dbSNPsite && normalNotHet >= somDbSnpThreshold) || (!dbSNPsite && normalNotHet >= somNovelThreshold)
+        val passSomatic = normalNotHet >= (if (dbSNPsite) somDbSnpThreshold else somNovelThreshold)
 
         val passNoiseFilter: Boolean = (recurrentMutSite || !noisyMutSite)
 
-        val nInsertions = tumors.map(ao => if (math.abs(ao.distanceToNearestReadInsertion.getOrElse(Int.MaxValue)) <= indelNearnessThreshold) 1 else 0).sum
-        val nDeletions = tumors.map(ao => if (math.abs(ao.distanceToNearestReadDeletion.getOrElse(Int.MaxValue)) <= indelNearnessThreshold) 1 else 0).sum
+        val nInsertions = tumors.flatMap(_.distanceToNearestReadInsertion).count(d => math.abs(d) <= indelNearnessThreshold)
+        val nDeletions = tumors.flatMap(_.distanceToNearestReadDeletion).count(d => math.abs(d) <= indelNearnessThreshold)
 
         val passIndel: Boolean = nInsertions < maxGapEventsThreshold && nDeletions < maxGapEventsThreshold && pointMutation
 
         val passStringentFilters = tumors.size.toDouble / tumorsRaw.size.toDouble > (1.0 - minPassStringentFiltersTumor)
 
-        val passMapq0Filter = tumorsRaw.filter(_.mapq.getOrElse(0) == 0).size.toDouble / tumorsRaw.size.toDouble <= maxMapq0Fraction &&
-          normals.filter(_.mapq.getOrElse(0) == 0).size.toDouble / normals.size.toDouble <= maxMapq0Fraction
+        def passMapq0(alleles: Iterable[AlleleObservation]) =
+          (alleles.count(_.mapq.getOrElse(0) == 0).toDouble / alleles.size) <= maxMapq0Fraction
+
+        val passMapq0Filter = passMapq0(tumorsRaw) && passMapq0(normals)
 
         val onlyTumorMut = tumors.filter(_.allele == alt)
 
-        val passMaxMapqAlt = if (onlyTumorMut.size > 0) onlyTumorMut.map(_.phred).max >= minPhredSupportingMutant else false
+        val passMaxMapqAlt = onlyTumorMut.exists(_.phred >= minPhredSupportingMutant)
 
-        val passMaxNormalSupport = normals.filter(_.allele == alt).size.toDouble / normals.size.toDouble <= maxNormalSupportingFracToTriggerQscoreCheck ||
+        val passMaxNormalSupport = normals.count(_.allele == alt).toDouble / normals.size <= maxNormalSupportingFracToTriggerQscoreCheck ||
           normals.filter(_.allele == alt).map(_.phred).sum < maxNormalQscoreSumSupportingMutant
 
         val tumorPos = tumors.filterNot(_.onNegativeStrand)
@@ -250,7 +252,7 @@ class MutectGenotyper(normalId: String,
           (powerNeg < 0.9 || lodNeg >= minThetaForPowerCalc)
 
         // Only pass mutations that do not cluster at the ends of reads
-        val passEndClustering = if (onlyTumorMut.size > 0) {
+        val passEndClustering = if (onlyTumorMut.isEmpty) false else {
           val forwardPositions: Seq[Double] = onlyTumorMut.map(_.offsetInAlignment.toDouble).toSeq
           val reversePositions: Seq[Double] = onlyTumorMut.map(ao => ao.alignedReadLen - ao.offsetInAlignment.toDouble - 1.0).toSeq
 
@@ -262,18 +264,12 @@ class MutectGenotyper(normalId: String,
 
           (forwardMad > minMedianAbsoluteDeviationOfAlleleInRead || forwardMedian > minMedianAbsoluteDeviationOfAlleleInRead) &&
             (reverseMad > minMedianAbsoluteDeviationOfAlleleInRead || reverseMedian > minMedianAbsoluteDeviationOfAlleleInRead)
-
-        } else false
-
-        // Do all filters pass?
-        if (passSomatic && passIndel && passStringentFilters && passMapq0Filter &&
-          passMaxMapqAlt && passMaxNormalSupport && passEndClustering &&
-          passingStrandBias && passNoiseFilter) {
-          Option(constructVariant(region, ref, alt, alleleObservation))
-        } else {
-          None
         }
 
+        Option(constructVariant(region, ref, alt, alleleObservation)).filter(_ =>
+          passSomatic && passIndel && passStringentFilters && passMapq0Filter &&
+            passMaxMapqAlt && passMaxNormalSupport && passEndClustering &&
+            passingStrandBias && passNoiseFilter)
       } else {
         // either there are 0 passing variants, or there are > 1 passing variants
         None
@@ -342,7 +338,7 @@ class MutectGenotyper(normalId: String,
   }
 
   def median(s: Seq[Double]): Double = {
-    val (lower, upper) = s.sortWith(_ < _).splitAt(s.size / 2)
+    val (lower, upper) = s.sorted.splitAt(s.size / 2)
     if (s.size % 2 == 0) (lower.last + upper.head) / 2.0 else upper.head
   }
 
