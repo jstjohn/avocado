@@ -23,7 +23,8 @@ import org.apache.spark.Logging
 import org.apache.spark.rdd.RDD
 import org.bdgenomics.adam.models.ReferencePosition
 import org.bdgenomics.adam.rdd.ADAMContext._
-import org.bdgenomics.adam.rich.RichAlignmentRecord
+import org.bdgenomics.adam.rich.{ DecadentRead, RichAlignmentRecord }
+import org.bdgenomics.adam.util.MdTag
 import org.bdgenomics.avocado.Timers._
 import org.bdgenomics.avocado.models.{ AlleleObservation, Observation }
 import org.bdgenomics.avocado.stats.AvocadoConfigAndStats
@@ -43,10 +44,38 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
 
   val companion: ExplorerCompanion = ReadExplorer
 
+  def mdTagToMismatchPositions(mdTag: MdTag, cigar: List[CigarElement]): Seq[Int] = {
+    var idx = 0
+    val insertions = cigar.map(c => {
+      (c, c.getLength)
+    }).map(kv => {
+      val r = (kv._1, idx)
+      idx += kv._2
+      r
+    }).flatMap(kv => {
+      val (ce, i) = kv
+      if (ce.getOperator == CigarOperator.I) {
+        (0 until ce.getLength).map(_ + i)
+      } else {
+        Seq.empty
+      }
+    })
+
+    val deletions = mdTag.deletions
+    val oriPositions = mdTag.mismatches.keys
+    var mismatchPositions = oriPositions.zip(oriPositions)
+    for (iPos <- insertions) {
+      mismatchPositions = mismatchPositions.map({ case (p, i) => if (i <= iPos) (p + 1, i) else (p, i) })
+    }
+    for ((dPos, _) <- deletions) {
+      mismatchPositions = mismatchPositions.map({ case (p, i) => if (i > dPos) (p - 1, i) else (p, i) })
+    }
+    mismatchPositions.map({ case (p, i) => p.toInt }).toSeq
+  }
+
   def readToObservations(r: (AlignmentRecord, Long)): Seq[Observation] = ExploringRead.time {
     val (read, readId) = r
     val richRead: RichAlignmentRecord = RichAlignmentRecord(read)
-
     // get read start, contig, strand, sample, mapq, and sequence
     var pos: Long = read.getStart
     val contig: String = read.getContig.getContigName
@@ -64,13 +93,90 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
     // get cigar, md tag, and phred scores for bases
     val cigar: List[CigarElement] = richRead.samtoolsCigar.getCigarElements
     val quals = richRead.qualityScores
-    val mdTag = richRead.mdTag
+    val mdString = read.getMismatchingPositions
+    val mismatchPositions: Option[Seq[Int]] = if (mdString != null && mdString != "")
+      Some(mdTagToMismatchPositions(MdTag(read.getMismatchingPositions,
+        if (cigar.head.getOperator == CigarOperator.S) cigar.head.getLength else 0,
+        richRead.samtoolsCigar), cigar))
+    else None
 
     // observations
     var observations = Seq[Observation]()
 
     // position in the current read
     var readPos = 0
+
+    // get the sum of mismatching bases
+    val qscores: Option[Seq[Int]] = mismatchPositions.map(l => {
+      l.map(p => {
+        quals(p)
+      })
+    })
+
+    val mismatchQScoreSum = qscores.map(_.sum)
+
+    // Helper function to get the unclipped read length (hard or soft) from CIGAR
+    def unclippedLenFromCigar(cigar: Cigar): Int = {
+      cigar.getCigarElements.map(ce => ce.getOperator match {
+        case CigarOperator.D | CigarOperator.N | CigarOperator.P => 0
+        case _ => ce.getLength
+      }).sum
+    }
+
+    def alignedLenFromCigar(cigar: Cigar): Int = {
+      cigar.getCigarElements.map(ce => ce.getOperator match {
+        case CigarOperator.D | CigarOperator.N | CigarOperator.P | CigarOperator.H | CigarOperator.S => 0
+        case _ => ce.getLength
+      }).sum
+    }
+
+    // Helper function to calculate the length of an element, if it is a clipping element
+    def basesTrimmed(cigarElement: CigarElement): Int = {
+      cigarElement.getOperator match {
+        case CigarOperator.S | CigarOperator.H => cigarElement.getLength
+        case _                                 => 0
+      }
+    }
+
+    // Set up variables to help with tracking the distance from indels, and
+    // the distance from the current allele to the first and last trimmed base
+    // within this read.
+    val readLen = unclippedLenFromCigar(richRead.samtoolsCigar)
+    val trimmedFromStart = basesTrimmed(cigar.head)
+    val trimmedFromEnd = basesTrimmed(cigar.last)
+    var softclippedBases = 0
+    val alignedLen = alignedLenFromCigar(richRead.samtoolsCigar)
+
+    val cigarLenOps = cigar.zipWithIndex.map({
+      case (ce: CigarElement, idx: Int) =>
+        (idx, (ce.getLength, ce.getOperator))
+    }).toMap
+
+    val insertions = cigarLenOps.filter({ case (idx, (len, op)) => op == CigarOperator.I })
+    val deletions = cigarLenOps.filter({ case (idx, (len, op)) => op == CigarOperator.D })
+
+    def makeNaieveDistanceVec(idx: Int, len: Int, del: Boolean): Vector[Int] = {
+      val lpre = (0 until idx).map(cigarLenOps(_)._1).sum
+      val lpost = ((idx + 1) until cigar.length).map(cigarLenOps(_)._1).sum
+      ((1 to lpre).reverse ++ (if (del) Vector.empty[Int] else Vector.fill(len)(0)) ++ (1 to lpost).map(-_)).toVector
+    }
+
+    val insertionDistVecs = insertions.map({ case (idx, (len, _)) => makeNaieveDistanceVec(idx, len, false) })
+    val deletionDistVecs = deletions.map({ case (idx, (len, _)) => makeNaieveDistanceVec(idx, len, true) })
+
+    val posToInsDist: Option[Vector[Int]] = if (insertionDistVecs.size > 0) Some(insertionDistVecs.transpose.map(l => l.minBy(Math.abs(_))).toVector) else None
+    val posToDelDist: Option[Vector[Int]] = if (deletionDistVecs.size > 0) Some(deletionDistVecs.transpose.map(l => l.minBy(Math.abs(_))).toVector) else None
+
+    def getTags(read: RichAlignmentRecord): Option[Seq[org.bdgenomics.adam.models.Attribute]] = {
+      try {
+        Option(read.tags)
+      } catch {
+        case e: NullPointerException => None
+      }
+    }
+
+    val tags: Option[Seq[org.bdgenomics.adam.models.Attribute]] = getTags(richRead)
+    val mateRescue: Boolean = tags.getOrElse(Seq()).exists(a => a.tag == "XT" && a.value == "M")
 
     def processAlignmentMatch() {
       observations = AlleleObservation(ReferencePosition(contig, pos),
@@ -80,7 +186,15 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
         mapq,
         negativeStrand,
         firstOfPair,
-        readPos,
+        readPos - softclippedBases,
+        alignedLen,
+        posToInsDist.map(_(readPos)),
+        posToDelDist.map(_(readPos)),
+        trimmedFromStart,
+        trimmedFromEnd,
+        readLen,
+        mismatchQScoreSum,
+        mateRescue,
         sample,
         readId) +: observations
       readPos += 1
@@ -100,13 +214,22 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
           mapq,
           negativeStrand,
           firstOfPair,
-          readPos,
+          readPos - softclippedBases,
+          alignedLen,
+          posToInsDist.map(_(readPos)),
+          posToDelDist.map(_(readPos)),
+          trimmedFromStart,
+          trimmedFromEnd,
+          readLen,
+          mismatchQScoreSum,
+          mateRescue,
           sample,
           readId).asInstanceOf[Observation] +: observations
 
         // increment read pointers
         readPos += alleleLength
         pos += 1
+
       } else if (idx + 1 < cigar.length && cigar(idx + 1).getOperator == CigarOperator.D) {
         // the allele includes the matching base
         val alleleLength = 1 + cigar(idx + 1).getLength
@@ -119,7 +242,15 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
           mapq,
           negativeStrand,
           firstOfPair,
-          readPos,
+          readPos - softclippedBases,
+          alignedLen,
+          posToInsDist.map(_(readPos)),
+          posToDelDist.map(_(readPos)),
+          trimmedFromStart,
+          trimmedFromEnd,
+          readLen,
+          mismatchQScoreSum,
+          mateRescue,
           sample,
           readId).asInstanceOf[Observation] +: observations
 
@@ -152,7 +283,9 @@ class ReadExplorer(referenceObservations: RDD[Observation]) extends Explorer wit
           // no op; handle inserts by looking ahead from match/mismatch operator
         }
         case CigarOperator.S => {
-          readPos += cigar(i).getLength
+          val clippedLen = cigar(i).getLength
+          readPos += clippedLen
+          softclippedBases += clippedLen
         }
         case CigarOperator.H =>
         case _ => {
